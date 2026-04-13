@@ -26,10 +26,13 @@ cooler_strength = np.random.uniform(2.0, 3.5)
 start_hot = np.random.rand() > 0.5
 if start_hot:
     temperature = np.random.uniform(setpoint + 8, setpoint + 18)
-    scenario_label = "Starts hot"
+    scenario_label = "Starts REALLY hot"
 else:
     temperature = np.random.uniform(setpoint - 18, setpoint - 8)
-    scenario_label = "Starts cold"
+    scenario_label = "Starts REALLY cold"
+
+initial_temperature = temperature
+control_start_time = 10.0
 
 # ----------------------------
 # Controller state
@@ -43,9 +46,8 @@ hysteresis = 0.15
 
 previous_temperature = temperature
 filtered_derivative = 0.0
-derivative_filter_alpha = 0.12  # smaller = smoother
+derivative_filter_alpha = 0.12
 
-# HVAC mode state: "heating", "cooling", or "idle"
 mode_state = "idle"
 
 # Actuator lag state
@@ -81,6 +83,13 @@ ax.axhline(setpoint, color="red", linestyle="--", linewidth=2,
 ax.axhline(outside_temp, color="gray", linestyle=":", linewidth=1.5,
            label=f"Outside = {outside_temp:.1f} °C")
 
+# Mark the starting point
+ax.plot(0, initial_temperature, marker="o", markersize=8, label="Starting Point")
+
+# Mark when control begins
+ax.axvline(control_start_time, color="purple", linestyle="--", linewidth=2,
+           label=f"Control starts at {control_start_time:.0f}s")
+
 ymin = min(outside_temp, setpoint, temperature) - 8
 ymax = max(outside_temp, setpoint, temperature) + 8
 
@@ -102,67 +111,61 @@ plt.show(block=False)
 # ----------------------------
 for step in range(steps):
     current_time = step * dt
-
     error = setpoint - temperature
 
-    # Derivative on measurement (less derivative kick than derivative on error)
     raw_derivative = -(temperature - previous_temperature) / dt
     filtered_derivative = (
         derivative_filter_alpha * raw_derivative
         + (1.0 - derivative_filter_alpha) * filtered_derivative
     )
 
-    # Proportional + derivative first
-    pd_control = Kp * error + Kd * filtered_derivative
-
-    # Predict unsaturated control using current integral
-    unsat_control = pd_control + Ki * integral
-    control = max(-100.0, min(100.0, unsat_control))
-
-    # Conditional integration:
-    # integrate only when:
-    # 1) outside deadband
-    # 2) either not saturated, or error would drive output back from saturation
-    if abs(error) > deadband:
-        pushing_further_into_high_sat = (control >= 100.0 and error > 0)
-        pushing_further_into_low_sat = (control <= -100.0 and error < 0)
-
-        if not (pushing_further_into_high_sat or pushing_further_into_low_sat):
-            integral += error * dt
-            integral = max(integral_min, min(integral_max, integral))
-
-    # Recompute control after integral update
-    unsat_control = pd_control + Ki * integral
-    control = max(-100.0, min(100.0, unsat_control))
-
-    # ----------------------------
-    # Hysteresis mode logic
-    # ----------------------------
-    if mode_state == "idle":
-        if temperature < setpoint - (deadband + hysteresis):
-            mode_state = "heating"
-        elif temperature > setpoint + (deadband + hysteresis):
-            mode_state = "cooling"
-
-    elif mode_state == "heating":
-        if temperature >= setpoint - hysteresis:
-            mode_state = "idle"
-
-    elif mode_state == "cooling":
-        if temperature <= setpoint + hysteresis:
-            mode_state = "idle"
-
-    # Enforce mode on control
-    if mode_state == "heating":
-        control = max(0.0, control)
-    elif mode_state == "cooling":
-        control = min(0.0, control)
-    else:
+    if current_time < control_start_time:
+        # Control disabled until 5 seconds
         control = 0.0
+        heater_command = 0.0
+        cooler_command = 0.0
+        mode_state = "idle"
+    else:
+        pd_control = Kp * error + Kd * filtered_derivative
 
-    # Commanded actuator values
-    heater_command = max(0.0, control)
-    cooler_command = max(0.0, -control)
+        unsat_control = pd_control + Ki * integral
+        control = max(-100.0, min(100.0, unsat_control))
+
+        if abs(error) > deadband:
+            pushing_further_into_high_sat = (control >= 100.0 and error > 0)
+            pushing_further_into_low_sat = (control <= -100.0 and error < 0)
+
+            if not (pushing_further_into_high_sat or pushing_further_into_low_sat):
+                integral += error * dt
+                integral = max(integral_min, min(integral_max, integral))
+
+        unsat_control = pd_control + Ki * integral
+        control = max(-100.0, min(100.0, unsat_control))
+
+        # Hysteresis mode logic
+        if mode_state == "idle":
+            if temperature < setpoint - (deadband + hysteresis):
+                mode_state = "heating"
+            elif temperature > setpoint + (deadband + hysteresis):
+                mode_state = "cooling"
+
+        elif mode_state == "heating":
+            if temperature >= setpoint - hysteresis:
+                mode_state = "idle"
+
+        elif mode_state == "cooling":
+            if temperature <= setpoint + hysteresis:
+                mode_state = "idle"
+
+        if mode_state == "heating":
+            control = max(0.0, control)
+        elif mode_state == "cooling":
+            control = min(0.0, control)
+        else:
+            control = 0.0
+
+        heater_command = max(0.0, control)
+        cooler_command = max(0.0, -control)
 
     # Actuator lag
     heater_actual += (heater_command - heater_actual) * dt / heater_time_constant
@@ -171,10 +174,8 @@ for step in range(steps):
     heater_actual = max(0.0, min(100.0, heater_actual))
     cooler_actual = max(0.0, min(100.0, cooler_actual))
 
-    # Disturbance / sensor noise effect on process
     disturbance = np.random.normal(0, 0.03)
 
-    # Room thermal model
     dTdt = (
         -ambient_exchange_rate * (temperature - outside_temp)
         + heater_strength * (heater_actual / 100.0)
@@ -185,7 +186,6 @@ for step in range(steps):
     temperature += dTdt * dt
     previous_temperature = temperature
 
-    # Save data
     time_data.append(current_time)
     temp_data.append(temperature)
     control_data.append(control)
@@ -197,7 +197,9 @@ for step in range(steps):
 
     line_temp.set_data(time_data, temp_data)
 
-    if heater_actual > 0.5:
+    if current_time < control_start_time:
+        mode_label = "Waiting"
+    elif heater_actual > 0.5:
         mode_label = "Heating"
     elif cooler_actual > 0.5:
         mode_label = "Cooling"
